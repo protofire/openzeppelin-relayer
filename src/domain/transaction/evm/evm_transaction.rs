@@ -1117,9 +1117,17 @@ where
                 tx_id = %tx.id,
                 relayer_id = %tx.relayer_id,
                 price_params = ?bumped_price_params,
-                "bumped gas price does not meet minimum requirement, skipping resubmission"
+                "bumped gas price does not meet minimum requirement, re-broadcasting signed transaction"
             );
-            return Ok(tx);
+            // Fees at gas_price_cap cannot be bumped; re-send the signed tx so it is not dropped (#808)
+            // Resubmit has no retries: an unclassified send error must not dead-queue the tx.
+            return match self.submit_transaction(tx.clone()).await {
+                Ok(tx) => Ok(tx),
+                Err(e) => {
+                    warn!(tx_id = %tx.id, error = %e, "re-broadcast at price cap failed");
+                    Ok(tx)
+                }
+            };
         }
 
         // Validate the relayer has sufficient balance
@@ -4551,5 +4559,133 @@ mod tests {
         let returned_tx = result.unwrap();
         // Status should remain Submitted (unchanged)
         assert_eq!(returned_tx.status, TransactionStatus::Submitted);
+    }
+
+    /// Fees already at gas_price_cap: no valid bump exists, so resubmit must
+    /// re-broadcast the signed raw tx unchanged instead of skipping (#808).
+    async fn run_capped_resubmit(send_error: Option<&'static str>) {
+        let mut mock_transaction = MockTransactionRepository::new();
+        let mut mock_provider = MockEvmProviderTrait::new();
+        let mut mock_job_producer = MockJobProducerTrait::new();
+        let mut mock_price_calculator = MockPriceCalculator::new();
+        let mut mock_network = MockNetworkRepository::new();
+
+        let mut test_tx = create_test_transaction();
+        test_tx.status = TransactionStatus::Submitted;
+        test_tx.sent_at = Some(Utc::now().to_rfc3339());
+        test_tx.network_data = NetworkTransactionData::Evm(EvmTransactionData {
+            nonce: Some(42),
+            hash: Some("0xoriginal_hash".to_string()),
+            raw: Some(vec![1, 2, 3]),
+            ..test_tx.network_data.get_evm_transaction_data().unwrap()
+        });
+        test_tx.hashes = vec!["0xoriginal_hash".to_string()];
+
+        mock_price_calculator
+            .expect_calculate_bumped_gas_price()
+            .times(1)
+            .returning(|_, _, _| {
+                Ok(PriceParams {
+                    gas_price: Some(20000000000),
+                    max_fee_per_gas: None,
+                    max_priority_fee_per_gas: None,
+                    is_min_bumped: Some(false),
+                    extra_fee: None,
+                    total_cost: U256::ZERO,
+                })
+            });
+
+        // The original signed bytes are re-sent unchanged; nothing is re-signed.
+        mock_provider
+            .expect_send_raw_transaction()
+            .times(1)
+            .withf(|raw| raw == [1u8, 2, 3])
+            .returning(move |_| {
+                Box::pin(async move {
+                    match send_error {
+                        Some(msg) => Err(crate::services::provider::ProviderError::Other(
+                            msg.to_string(),
+                        )),
+                        None => Ok("0xoriginal_hash".to_string()),
+                    }
+                })
+            });
+
+        let test_tx_clone = test_tx.clone();
+        match send_error {
+            // Unclassified rejection (e.g. base fee above the cap): nothing is written.
+            Some("max fee per gas less than block base fee") => {}
+            Some("nonce too low") => {
+                let network_model = create_test_network_repo_model("mainnet", Some(5));
+                mock_network
+                    .expect_get_by_name()
+                    .times(1)
+                    .return_once(move |_, _| Ok(Some(network_model)));
+                mock_job_producer
+                    .expect_produce_check_transaction_status_job()
+                    .times(1)
+                    .withf(|job, _| {
+                        job.metadata
+                            .as_ref()
+                            .is_some_and(|m| m.contains_key(TX_NONCE_RECONCILE_TRIGGER))
+                    })
+                    .returning(|_, _| Box::pin(ready(Ok(()))));
+                mock_transaction
+                    .expect_partial_update()
+                    .times(1)
+                    .withf(|_, update| update.status_reason.is_some() && update.hashes.is_none())
+                    .returning(move |_, _| Ok(test_tx_clone.clone()));
+            }
+            _ => {
+                mock_transaction
+                    .expect_partial_update()
+                    .times(1)
+                    .withf(|_, update| {
+                        update.status == Some(TransactionStatus::Submitted)
+                            && update.network_data.is_none()
+                            && update.hashes.is_none()
+                    })
+                    .returning(move |_, _| Ok(test_tx_clone.clone()));
+                mock_job_producer
+                    .expect_produce_send_notification_job()
+                    .times(1)
+                    .returning(|_, _| Box::pin(ready(Ok(()))));
+            }
+        }
+
+        let evm_transaction = EvmRelayerTransaction {
+            relayer: create_test_relayer(),
+            provider: mock_provider,
+            relayer_repository: Arc::new(MockRelayerRepository::new()),
+            network_repository: Arc::new(mock_network),
+            transaction_repository: Arc::new(mock_transaction),
+            transaction_counter_service: Arc::new(MockTransactionCounterTrait::new()),
+            job_producer: Arc::new(mock_job_producer),
+            price_calculator: mock_price_calculator,
+            signer: MockSigner::new(),
+        };
+
+        let result = evm_transaction.resubmit_transaction(test_tx).await;
+        result.expect("capped resubmit must return Ok");
+    }
+
+    #[tokio::test]
+    async fn test_resubmit_transaction_at_price_cap_rebroadcasts_raw() {
+        run_capped_resubmit(None).await;
+    }
+
+    #[tokio::test]
+    async fn test_resubmit_transaction_at_price_cap_already_known() {
+        run_capped_resubmit(Some("already known")).await;
+    }
+
+    #[tokio::test]
+    async fn test_resubmit_transaction_at_price_cap_nonce_too_low_schedules_recovery() {
+        run_capped_resubmit(Some("nonce too low")).await;
+    }
+
+    #[tokio::test]
+    async fn test_resubmit_transaction_at_price_cap_unclassified_error_returns_ok() {
+        run_capped_resubmit(Some("max fee per gas less than block base fee")).await;
     }
 }
