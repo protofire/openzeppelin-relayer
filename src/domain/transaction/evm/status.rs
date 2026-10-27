@@ -21,9 +21,10 @@ use super::{
     too_many_attempts, too_many_noop_attempts,
 };
 use crate::constants::{
-    get_evm_min_age_for_hash_recovery, get_evm_pending_recovery_trigger_timeout,
-    get_evm_prepare_timeout, get_evm_resend_timeout, ARBITRUM_TIME_TO_RESUBMIT,
-    DEFAULT_EVM_INCLUDE_REVERT_DATA, EVM_MIN_HASHES_FOR_RECOVERY, MAX_GAP_SCAN_RANGE,
+    get_evm_min_age_for_hash_recovery, get_evm_nonce_consumed_grace,
+    get_evm_pending_recovery_trigger_timeout, get_evm_prepare_timeout, get_evm_resend_timeout,
+    ARBITRUM_TIME_TO_RESUBMIT, DEFAULT_EVM_INCLUDE_REVERT_DATA, EVM_MIN_HASHES_FOR_RECOVERY,
+    MAX_GAP_SCAN_RANGE,
 };
 use crate::domain::transaction::common::{
     get_age_of_sent_at, is_final_state, is_pending_transaction,
@@ -36,7 +37,7 @@ use crate::{
     jobs::{JobProducerTrait, StatusCheckContext},
     models::{
         EvmTransactionData, NetworkTransactionData, RelayerRepoModel, TransactionError,
-        TransactionRepoModel, TransactionStatus, TransactionUpdateRequest,
+        TransactionMetadata, TransactionRepoModel, TransactionStatus, TransactionUpdateRequest,
     },
     repositories::{Repository, TransactionCounterTrait, TransactionRepository},
     services::{provider::EvmProviderTrait, signer::Signer},
@@ -51,6 +52,32 @@ const REVERT_REASON_GENERIC: &str = "Transaction reverted on-chain (receipt stat
 /// are normally tiny, but they are RPC/contract-controlled, so we cap the recovered hex before it
 /// is persisted to avoid an oversized DB write or notification payload.
 const MAX_REVERT_DATA_HEX_LEN: usize = 4096;
+
+/// Parsed start of the #817 grace ("nonce consumed, no receipt"); `None` when unset,
+/// unparsable or stale, all of which (re)start it in reconcile.
+fn nonce_consumed_since(tx: &TransactionRepoModel) -> Option<DateTime<Utc>> {
+    let since = tx
+        .metadata
+        .as_ref()?
+        .nonce_consumed_since
+        .as_deref()
+        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())?;
+    // A successful (re)send after the marker ended that episode; a later one gets a fresh grace.
+    let sent_at = tx
+        .sent_at
+        .as_deref()
+        .and_then(|s| DateTime::parse_from_rfc3339(s).ok());
+    sent_at
+        .is_none_or(|s| since >= s)
+        .then_some(since.with_timezone(&Utc))
+}
+
+/// Whether the #817 grace is running. An unparsable stored time does not block resubmits;
+/// the next reconcile restarts the grace.
+fn in_nonce_consumed_grace(tx: &TransactionRepoModel) -> bool {
+    // No sent_at shortcut: a broadcast tx can lack it (timed-out send, AlreadyKnown on resend).
+    nonce_consumed_since(tx).is_some_and(|t| Utc::now() - t < get_evm_nonce_consumed_grace())
+}
 
 /// Caps an overlong revert-data hex string to [`MAX_REVERT_DATA_HEX_LEN`], appending a marker so
 /// consumers can tell the payload was clipped. The hex is ASCII, so slicing on a byte index is safe.
@@ -303,6 +330,11 @@ where
     ) -> Result<bool, TransactionError> {
         // Validate transaction is in correct state for resubmission
         ensure_status(tx, TransactionStatus::Submitted, Some("should_resubmit"))?;
+
+        // Nonce already consumed on-chain (#817 grace): a resubmit can only get NonceTooLow.
+        if in_nonce_consumed_grace(tx) {
+            return Ok(false);
+        }
 
         let evm_data = tx.network_data.get_evm_transaction_data()?;
         let age = get_age_of_sent_at(tx)?;
@@ -844,6 +876,8 @@ where
                         hash = %hash,
                         "nonce recovery: receipt found for current hash, deferring to normal flow"
                     );
+                    // Receipt ends the #817 episode; a later new episode gets a fresh grace.
+                    self.write_nonce_consumed_since(tx, None).await?;
                     return Ok(None);
                 }
                 Ok(None) => {
@@ -915,6 +949,50 @@ where
             })?;
 
         if on_chain_nonce > tx_nonce {
+            // Mined means we already saw our own receipt: the nonce was not consumed externally.
+            if tx.status == TransactionStatus::Mined {
+                return Ok(None);
+            }
+
+            // A null receipt can be a lagging RPC node, not absence (#817). Wait a grace
+            // (see in_nonce_consumed_grace), counted from the first such observation.
+            if evm_data.hash.is_some() {
+                // Unset or unparsable: (re)start the grace rather than finalizing.
+                if nonce_consumed_since(tx).is_none() {
+                    warn!(
+                        tx_id = %tx.id,
+                        tx_nonce = tx_nonce,
+                        on_chain_nonce = on_chain_nonce,
+                        "nonce recovery: nonce consumed but no receipt yet, deferring"
+                    );
+                    self.write_nonce_consumed_since(tx, Some(Utc::now().to_rfc3339()))
+                        .await?;
+                    // Sync the counter now, not after the long grace; it never touches this tx.
+                    let debounce = NONCE_HEALTH_DEBOUNCE
+                        .get_or_init(|| TtlDebounce::new(NONCE_HEALTH_DEBOUNCE_TTL));
+                    if debounce.should_fire(&tx.relayer_id) {
+                        if let Err(e) = self.schedule_relayer_nonce_health_job(tx).await {
+                            warn!(
+                                tx_id = %tx.id,
+                                error = %e,
+                                "nonce recovery: failed to schedule nonce health after consumed nonce"
+                            );
+                            debounce.clear(&tx.relayer_id);
+                        }
+                    }
+                    return Ok(None);
+                }
+                if in_nonce_consumed_grace(tx) {
+                    debug!(
+                        tx_id = %tx.id,
+                        tx_nonce = tx_nonce,
+                        on_chain_nonce = on_chain_nonce,
+                        "nonce recovery: nonce consumed but no receipt yet, deferring"
+                    );
+                    return Ok(None);
+                }
+            }
+
             // Nonce was consumed but no known hash found — consumed externally
             let reason = format!(
                 "Nonce {tx_nonce} consumed externally (on-chain nonce: {on_chain_nonce}). \
@@ -954,7 +1032,32 @@ where
             on_chain_nonce = on_chain_nonce,
             "nonce recovery: on-chain nonce not past tx nonce, deferring to normal flow"
         );
+        // Nonce not consumed (reorg, or a node that was ahead) ends the #817 episode.
+        self.write_nonce_consumed_since(tx, None).await?;
         Ok(None)
+    }
+
+    /// Persists the #817 grace start; skips the write when clearing an already-unset field.
+    async fn write_nonce_consumed_since(
+        &self,
+        tx: &TransactionRepoModel,
+        value: Option<String>,
+    ) -> Result<(), TransactionError> {
+        let meta = tx.metadata.clone().unwrap_or_default();
+        if value.is_none() && meta.nonce_consumed_since.is_none() {
+            return Ok(());
+        }
+        let update = TransactionUpdateRequest {
+            metadata: Some(TransactionMetadata {
+                nonce_consumed_since: value,
+                ..meta
+            }),
+            ..Default::default()
+        };
+        self.transaction_repository()
+            .partial_update(tx.id.clone(), update)
+            .await?;
+        Ok(())
     }
 
     /// Handles circuit breaker safely based on transaction status.
@@ -1365,6 +1468,13 @@ where
             relayer_id = %tx.relayer_id,
             "handling Sent state"
         );
+
+        // Nonce already consumed on-chain (#817 grace): a NOOP or resubmit can only get NonceTooLow.
+        if in_nonce_consumed_grace(&tx) {
+            return self
+                .update_transaction_status_if_needed(tx, TransactionStatus::Sent, None)
+                .await;
+        }
 
         // Check if transaction should be replaced with NOOP (expired, too many attempts on rollup, etc.)
         let (should_noop, reason) = self.should_noop(&tx).await?;
@@ -4682,8 +4792,11 @@ mod tests {
 
     mod nonce_recovery_tests {
         use super::*;
+        use crate::constants::get_evm_nonce_consumed_grace;
         use crate::domain::transaction::evm::evm_transaction::TX_NONCE_RECONCILE_TRIGGER;
         use crate::jobs::StatusCheckContext;
+        use crate::models::TransactionMetadata;
+        use chrono::DateTime;
 
         /// Test reconcile_tx_nonce_state with on_chain_nonce > tx_nonce → marks Failed
         #[tokio::test]
@@ -4698,7 +4811,11 @@ mod tests {
                 raw: Some(vec![1, 2, 3]),
                 ..tx.network_data.get_evm_transaction_data().unwrap()
             });
-            tx.sent_at = Some(Utc::now().to_rfc3339());
+            // Grace elapsed: the nonce was first seen consumed without a receipt long ago,
+            // after the last successful send.
+            let since = Utc::now() - get_evm_nonce_consumed_grace() - Duration::seconds(1);
+            tx.sent_at = Some((since - Duration::seconds(30)).to_rfc3339());
+            tx.metadata = Some(nonce_consumed_since(since));
 
             // No receipt for current hash
             mocks
@@ -4876,7 +4993,11 @@ mod tests {
                 raw: Some(vec![1, 2, 3]),
                 ..tx.network_data.get_evm_transaction_data().unwrap()
             });
-            tx.sent_at = Some(Utc::now().to_rfc3339());
+            // Grace elapsed: the nonce was first seen consumed without a receipt long ago,
+            // after the last successful send.
+            let since = Utc::now() - get_evm_nonce_consumed_grace() - Duration::seconds(1);
+            tx.sent_at = Some((since - Duration::seconds(30)).to_rfc3339());
+            tx.metadata = Some(nonce_consumed_since(since));
 
             // No receipt for current hash
             mocks
@@ -4923,6 +5044,580 @@ mod tests {
             let result = evm_transaction.handle_status_impl(tx, Some(context)).await;
             assert!(result.is_ok());
             assert_eq!(result.unwrap().status, TransactionStatus::Failed);
+        }
+
+        fn nonce_consumed_since(at: DateTime<Utc>) -> TransactionMetadata {
+            TransactionMetadata {
+                nonce_consumed_since: Some(at.to_rfc3339()),
+                ..Default::default()
+            }
+        }
+
+        /// Submitted tx with a broadcast hash whose nonce is consumed on-chain and whose
+        /// receipt reads null.
+        fn consumed_no_receipt_setup(
+            metadata: Option<TransactionMetadata>,
+        ) -> (TransactionRepoModel, TestMocks) {
+            let mut mocks = default_test_mocks();
+            let mut tx = make_test_transaction(TransactionStatus::Submitted);
+            tx.network_data = NetworkTransactionData::Evm(EvmTransactionData {
+                nonce: Some(5),
+                hash: Some("0xhash".to_string()),
+                raw: Some(vec![1, 2, 3]),
+                ..tx.network_data.get_evm_transaction_data().unwrap()
+            });
+            tx.metadata = metadata;
+            mocks
+                .provider
+                .expect_get_transaction_receipt()
+                .returning(|_| Box::pin(async { Ok(None) }));
+            mocks
+                .provider
+                .expect_get_transaction_count()
+                .returning(|_| Box::pin(async { Ok(10) }));
+            (tx, mocks)
+        }
+
+        /// Expects the best-effort nonce health job scheduled when the grace (re)starts.
+        /// A unique relayer id keeps the process-global per-relayer debounce out of the way.
+        fn expect_nonce_health_once(
+            mocks: &mut TestMocks,
+            tx: &mut TransactionRepoModel,
+            relayer_id: &str,
+        ) {
+            tx.relayer_id = relayer_id.to_string();
+            mocks
+                .job_producer
+                .expect_produce_relayer_health_check_job()
+                .times(1)
+                .returning(|_, _| Box::pin(async { Ok(()) }));
+        }
+
+        /// #817: first "nonce consumed, no receipt" observation defers (Ok(None)) and
+        /// records when it was first seen instead of finalizing Failed.
+        #[tokio::test]
+        async fn test_nonce_recovery_consumed_no_receipt_starts_grace() {
+            let (mut tx, mut mocks) = consumed_no_receipt_setup(None);
+            expect_nonce_health_once(&mut mocks, &mut tx, "817-starts-grace");
+            let before = Utc::now();
+            let tx_clone = tx.clone();
+            mocks
+                .tx_repo
+                .expect_partial_update()
+                .times(1)
+                .withf(move |_, update| {
+                    update.status.is_none()
+                        && update
+                            .metadata
+                            .as_ref()
+                            .and_then(|m| m.nonce_consumed_since.as_deref())
+                            .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+                            .is_some_and(|t| t >= before - Duration::seconds(1))
+                })
+                .returning(move |_, update| {
+                    let mut updated_tx = tx_clone.clone();
+                    updated_tx.metadata = update.metadata.clone();
+                    Ok(updated_tx)
+                });
+
+            let evm_transaction = make_test_evm_relayer_transaction(create_test_relayer(), mocks);
+            let result = evm_transaction.reconcile_tx_nonce_state(&tx).await;
+
+            assert!(
+                result.unwrap().is_none(),
+                "Expected None: must keep polling the receipt before finalizing"
+            );
+        }
+
+        /// #817: a later pass inside the grace defers without overwriting the first-seen time.
+        #[tokio::test]
+        async fn test_nonce_recovery_within_grace_keeps_first_seen() {
+            let (tx, mut mocks) = consumed_no_receipt_setup(Some(nonce_consumed_since(Utc::now())));
+            mocks.tx_repo.expect_partial_update().never();
+
+            let evm_transaction = make_test_evm_relayer_transaction(create_test_relayer(), mocks);
+            let result = evm_transaction.reconcile_tx_nonce_state(&tx).await;
+
+            assert!(result.unwrap().is_none());
+        }
+
+        /// #817: a Mined tx already had our own receipt, so its nonce was not consumed
+        /// externally; reconcile must not finalize it Failed even after the grace.
+        #[tokio::test]
+        async fn test_nonce_recovery_mined_never_consumed_externally() {
+            let (mut tx, mut mocks) = consumed_no_receipt_setup(Some(nonce_consumed_since(
+                Utc::now() - get_evm_nonce_consumed_grace() - Duration::seconds(1),
+            )));
+            tx.status = TransactionStatus::Mined;
+            mocks.tx_repo.expect_partial_update().never();
+
+            let evm_transaction = make_test_evm_relayer_transaction(create_test_relayer(), mocks);
+            let result = evm_transaction.reconcile_tx_nonce_state(&tx).await;
+
+            assert!(result.unwrap().is_none());
+        }
+
+        /// #817: while the grace runs, a stale Submitted tx must not be resubmitted: the
+        /// nonce is already consumed, so a resubmit only gets NonceTooLow and schedules
+        /// yet another reconcile job (hot loop).
+        #[tokio::test]
+        async fn test_submitted_within_grace_skips_resubmit() {
+            let (mut tx, mut mocks) =
+                consumed_no_receipt_setup(Some(nonce_consumed_since(Utc::now())));
+            tx.created_at = (Utc::now() - Duration::seconds(600)).to_rfc3339();
+            tx.sent_at = Some((Utc::now() - Duration::seconds(600)).to_rfc3339());
+            mocks
+                .network_repo
+                .expect_get_by_chain_id()
+                .returning(|_, _| Ok(Some(create_test_network_model())));
+            mocks
+                .provider
+                .expect_get_block_number()
+                .returning(|| Box::pin(async { Ok(100) }));
+            mocks.provider.expect_get_block_by_number().returning(|| {
+                Box::pin(async {
+                    use alloy::{network::AnyRpcBlock, rpc::types::Block};
+                    let mut block: Block = Block::default();
+                    block.header.gas_limit = 30_000_000u64;
+                    Ok(AnyRpcBlock::from(block))
+                })
+            });
+            let tx_clone = tx.clone();
+            mocks
+                .tx_repo
+                .expect_partial_update()
+                .returning(move |_, _| Ok(tx_clone.clone()));
+            mocks
+                .job_producer
+                .expect_produce_submit_transaction_job()
+                .never();
+
+            let evm_transaction = make_test_evm_relayer_transaction(create_test_relayer(), mocks);
+            let mut metadata = std::collections::HashMap::new();
+            metadata.insert(
+                TX_NONCE_RECONCILE_TRIGGER.to_string(),
+                "NonceTooLow".to_string(),
+            );
+            let context = StatusCheckContext::default().with_job_metadata(Some(metadata));
+
+            let result = evm_transaction
+                .handle_status_impl(tx, Some(context))
+                .await
+                .unwrap();
+            assert!(!crate::domain::transaction::common::is_final_state(
+                &result.status
+            ));
+        }
+
+        /// #817: same for a stale Sent tx (Sent + NonceTooLow in submit also reaches reconcile).
+        #[tokio::test]
+        async fn test_sent_within_grace_skips_resubmit() {
+            let mut mocks = default_test_mocks();
+            let mut tx = make_test_transaction(TransactionStatus::Sent);
+            tx.sent_at = Some((Utc::now() - Duration::seconds(60)).to_rfc3339());
+            tx.metadata = Some(nonce_consumed_since(Utc::now()));
+            mocks
+                .job_producer
+                .expect_produce_submit_transaction_job()
+                .never();
+
+            let evm_transaction = make_test_evm_relayer_transaction(create_test_relayer(), mocks);
+            let result = evm_transaction.handle_sent_state(tx).await.unwrap();
+            assert_eq!(result.status, TransactionStatus::Sent);
+        }
+
+        /// #817: a marker older than the last successful (re)send belongs to an ended
+        /// episode; it must not finalize Failed but start a fresh grace.
+        #[tokio::test]
+        async fn test_nonce_recovery_marker_before_send_restarts_grace() {
+            let (mut tx, mut mocks) = consumed_no_receipt_setup(Some(nonce_consumed_since(
+                Utc::now() - Duration::minutes(10),
+            )));
+            tx.sent_at = Some((Utc::now() - Duration::minutes(1)).to_rfc3339());
+            expect_nonce_health_once(&mut mocks, &mut tx, "817-marker-before-send");
+            let before = Utc::now();
+            let tx_clone = tx.clone();
+            mocks
+                .tx_repo
+                .expect_partial_update()
+                .times(1)
+                .withf(move |_, update| {
+                    update.status.is_none()
+                        && update
+                            .metadata
+                            .as_ref()
+                            .and_then(|m| m.nonce_consumed_since.as_deref())
+                            .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+                            .is_some_and(|t| t >= before - Duration::seconds(1))
+                })
+                .returning(move |_, _| Ok(tx_clone.clone()));
+
+            let evm_transaction = make_test_evm_relayer_transaction(create_test_relayer(), mocks);
+            let result = evm_transaction.reconcile_tx_nonce_state(&tx).await;
+
+            assert!(result.unwrap().is_none());
+        }
+
+        /// #817 F1: nonce no longer consumed (reorg, or a node that was ahead) ends the
+        /// episode: the first-seen time is cleared so resubmits are not blocked.
+        #[tokio::test]
+        async fn test_nonce_recovery_not_consumed_clears_first_seen() {
+            let mut mocks = default_test_mocks();
+            let mut tx = make_test_transaction(TransactionStatus::Submitted);
+            tx.network_data = NetworkTransactionData::Evm(EvmTransactionData {
+                nonce: Some(5),
+                hash: Some("0xhash".to_string()),
+                ..tx.network_data.get_evm_transaction_data().unwrap()
+            });
+            tx.metadata = Some(nonce_consumed_since(Utc::now()));
+            mocks
+                .provider
+                .expect_get_transaction_receipt()
+                .returning(|_| Box::pin(async { Ok(None) }));
+            mocks
+                .provider
+                .expect_get_transaction_count()
+                .returning(|_| Box::pin(async { Ok(5) }));
+            let tx_clone = tx.clone();
+            mocks
+                .tx_repo
+                .expect_partial_update()
+                .times(1)
+                .withf(|_, update| {
+                    update.status.is_none()
+                        && update
+                            .metadata
+                            .as_ref()
+                            .is_some_and(|m| m.nonce_consumed_since.is_none())
+                })
+                .returning(move |_, _| Ok(tx_clone.clone()));
+
+            let evm_transaction = make_test_evm_relayer_transaction(create_test_relayer(), mocks);
+            let result = evm_transaction.reconcile_tx_nonce_state(&tx).await;
+
+            assert!(result.unwrap().is_none());
+        }
+
+        /// #817 F2: once the grace has expired, a stale Submitted tx is resubmitted again,
+        /// so the NonceTooLow path can finalize it even if the triggered job was lost.
+        #[tokio::test]
+        async fn test_submitted_after_grace_resubmits() {
+            let mut mocks = default_test_mocks();
+            let mut tx = make_test_transaction(TransactionStatus::Submitted);
+            let since = Utc::now() - get_evm_nonce_consumed_grace() - Duration::seconds(1);
+            tx.sent_at = Some((since - Duration::seconds(30)).to_rfc3339());
+            tx.metadata = Some(nonce_consumed_since(since));
+            mocks
+                .network_repo
+                .expect_get_by_chain_id()
+                .returning(|_, _| Ok(Some(create_test_network_model())));
+            mocks.provider.expect_get_block_by_number().returning(|| {
+                Box::pin(async {
+                    use alloy::{network::AnyRpcBlock, rpc::types::Block};
+                    let mut block: Block = Block::default();
+                    block.header.gas_limit = 30_000_000u64;
+                    Ok(AnyRpcBlock::from(block))
+                })
+            });
+            mocks
+                .provider
+                .expect_get_transaction_count()
+                .returning(|_| Box::pin(async { Ok(10) }));
+            mocks
+                .job_producer
+                .expect_produce_submit_transaction_job()
+                .times(1)
+                .returning(|_, _| Box::pin(async { Ok(()) }));
+            mocks
+                .job_producer
+                .expect_produce_check_transaction_status_job()
+                .returning(|_, _| Box::pin(async { Ok(()) }));
+
+            let evm_transaction = make_test_evm_relayer_transaction(create_test_relayer(), mocks);
+            let result = evm_transaction.handle_submitted_state(tx).await.unwrap();
+            assert_eq!(result.status, TransactionStatus::Submitted);
+        }
+
+        /// #817 F5: without a broadcast hash there is nothing to wait for, so a consumed
+        /// nonce finalizes Failed on the first pass (upstream behaviour).
+        #[tokio::test]
+        async fn test_nonce_recovery_no_hash_fails_first_pass() {
+            let mut mocks = default_test_mocks();
+            let mut tx = make_test_transaction(TransactionStatus::Submitted);
+            tx.network_data = NetworkTransactionData::Evm(EvmTransactionData {
+                nonce: Some(5),
+                hash: None,
+                ..tx.network_data.get_evm_transaction_data().unwrap()
+            });
+            mocks
+                .provider
+                .expect_get_transaction_count()
+                .returning(|_| Box::pin(async { Ok(10) }));
+            let tx_clone = tx.clone();
+            mocks
+                .tx_repo
+                .expect_partial_update()
+                .withf(|_, update| {
+                    update.status == Some(TransactionStatus::Failed)
+                        && update
+                            .status_reason
+                            .as_deref()
+                            .is_some_and(|r| r.contains("consumed externally"))
+                })
+                .returning(move |_, update| {
+                    let mut updated_tx = tx_clone.clone();
+                    updated_tx.status = update.status.unwrap();
+                    Ok(updated_tx)
+                });
+            mocks
+                .job_producer
+                .expect_produce_relayer_health_check_job()
+                .times(1)
+                .returning(|_, _| Box::pin(async { Ok(()) }));
+
+            let evm_transaction = make_test_evm_relayer_transaction(create_test_relayer(), mocks);
+            let result = evm_transaction.reconcile_tx_nonce_state(&tx).await;
+
+            assert_eq!(
+                result.unwrap().map(|t| t.status),
+                Some(TransactionStatus::Failed)
+            );
+        }
+
+        /// #817: an unparsable first-seen time restarts the grace instead of finalizing.
+        #[tokio::test]
+        async fn test_nonce_recovery_bad_timestamp_restarts_grace() {
+            let (mut tx, mut mocks) = consumed_no_receipt_setup(Some(TransactionMetadata {
+                nonce_consumed_since: Some("not-a-time".to_string()),
+                ..Default::default()
+            }));
+            expect_nonce_health_once(&mut mocks, &mut tx, "817-bad-timestamp");
+            let tx_clone = tx.clone();
+            mocks
+                .tx_repo
+                .expect_partial_update()
+                .times(1)
+                .withf(|_, update| {
+                    update.status.is_none()
+                        && update
+                            .metadata
+                            .as_ref()
+                            .and_then(|m| m.nonce_consumed_since.as_deref())
+                            .is_some_and(|s| DateTime::parse_from_rfc3339(s).is_ok())
+                })
+                .returning(move |_, _| Ok(tx_clone.clone()));
+
+            let evm_transaction = make_test_evm_relayer_transaction(create_test_relayer(), mocks);
+            let result = evm_transaction.reconcile_tx_nonce_state(&tx).await;
+
+            assert!(result.unwrap().is_none());
+        }
+
+        /// A found receipt ends the episode and clears the first-seen time, so a later new
+        /// "nonce consumed, no receipt" episode gets a fresh grace.
+        #[tokio::test]
+        async fn test_nonce_recovery_receipt_found_clears_first_seen() {
+            let mut mocks = default_test_mocks();
+            let mut tx = make_test_transaction(TransactionStatus::Mined);
+            tx.network_data = NetworkTransactionData::Evm(EvmTransactionData {
+                nonce: Some(5),
+                hash: Some("0xhash".to_string()),
+                ..tx.network_data.get_evm_transaction_data().unwrap()
+            });
+            tx.metadata = Some(nonce_consumed_since(Utc::now() - Duration::minutes(10)));
+            mocks
+                .provider
+                .expect_get_transaction_receipt()
+                .returning(|_| Box::pin(async { Ok(Some(make_mock_receipt(true, Some(100)))) }));
+            let tx_clone = tx.clone();
+            mocks
+                .tx_repo
+                .expect_partial_update()
+                .times(1)
+                .withf(|_, update| {
+                    update.status.is_none()
+                        && update
+                            .metadata
+                            .as_ref()
+                            .is_some_and(|m| m.nonce_consumed_since.is_none())
+                })
+                .returning(move |_, _| Ok(tx_clone.clone()));
+
+            let evm_transaction = make_test_evm_relayer_transaction(create_test_relayer(), mocks);
+            let result = evm_transaction.reconcile_tx_nonce_state(&tx).await;
+
+            assert!(result.unwrap().is_none());
+        }
+
+        /// #817: a transient null receipt while the nonce is already consumed must not
+        /// finalize Failed; the next read that returns the receipt wins.
+        #[tokio::test]
+        async fn test_nonce_recovery_transient_null_receipt_defers() {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            let mut mocks = default_test_mocks();
+            let relayer = create_test_relayer();
+
+            let mut tx = make_test_transaction(TransactionStatus::Submitted);
+            tx.network_data = NetworkTransactionData::Evm(EvmTransactionData {
+                nonce: Some(5),
+                hash: Some("0xhash".to_string()),
+                raw: Some(vec![1, 2, 3]),
+                ..tx.network_data.get_evm_transaction_data().unwrap()
+            });
+            tx.sent_at = Some(Utc::now().to_rfc3339());
+
+            // First receipt read (reconcile) is null, later reads see the mined receipt.
+            let calls = std::sync::Arc::new(AtomicUsize::new(0));
+            mocks
+                .provider
+                .expect_get_transaction_receipt()
+                .returning(move |_| {
+                    let n = calls.fetch_add(1, Ordering::SeqCst);
+                    Box::pin(async move { Ok((n > 0).then(|| make_mock_receipt(true, Some(100)))) })
+                });
+            mocks
+                .provider
+                .expect_get_transaction_count()
+                .returning(|_| Box::pin(async { Ok(10) }));
+            mocks
+                .provider
+                .expect_get_block_number()
+                .returning(|| Box::pin(async { Ok(100) }));
+            mocks
+                .network_repo
+                .expect_get_by_chain_id()
+                .returning(|_, _| Ok(Some(create_test_network_model())));
+
+            let tx_clone = tx.clone();
+            mocks
+                .tx_repo
+                .expect_partial_update()
+                .withf(|_, update| update.status != Some(TransactionStatus::Failed))
+                .returning(move |_, update| {
+                    let mut updated_tx = tx_clone.clone();
+                    if let Some(status) = update.status {
+                        updated_tx.status = status;
+                    }
+                    if update.metadata.is_some() {
+                        updated_tx.metadata = update.metadata.clone();
+                    }
+                    Ok(updated_tx)
+                });
+            let tx_for_get = tx.clone();
+            mocks
+                .tx_repo
+                .expect_get_by_id()
+                .returning(move |_| Ok(tx_for_get.clone()));
+            mocks
+                .job_producer
+                .expect_produce_send_notification_job()
+                .returning(|_, _| Box::pin(async { Ok(()) }));
+            expect_nonce_health_once(&mut mocks, &mut tx, "817-status-impl-receipt-lag");
+
+            let evm_transaction = make_test_evm_relayer_transaction(relayer, mocks);
+            let mut metadata = std::collections::HashMap::new();
+            metadata.insert(
+                TX_NONCE_RECONCILE_TRIGGER.to_string(),
+                "NonceTooLow".to_string(),
+            );
+            let context = StatusCheckContext::default().with_job_metadata(Some(metadata));
+
+            let result = evm_transaction.handle_status_impl(tx, Some(context)).await;
+            assert_ne!(result.unwrap().status, TransactionStatus::Failed);
+        }
+
+        /// #817: sent_at None does not mean unbroadcast (a timed-out send the node accepted,
+        /// or AlreadyKnown on resend), so it gets the same long grace.
+        #[tokio::test]
+        async fn test_nonce_recovery_no_sent_at_defers_past_short_grace() {
+            let (tx, mut mocks) = consumed_no_receipt_setup(Some(nonce_consumed_since(
+                Utc::now() - Duration::minutes(5),
+            )));
+            assert!(tx.sent_at.is_none());
+            mocks.tx_repo.expect_partial_update().never();
+
+            let evm_transaction = make_test_evm_relayer_transaction(create_test_relayer(), mocks);
+            let result = evm_transaction.reconcile_tx_nonce_state(&tx).await;
+
+            assert!(result.unwrap().is_none());
+        }
+
+        /// #817: grace starts on the same relayer share the gap detector's health-job debounce.
+        #[tokio::test]
+        async fn test_nonce_recovery_grace_start_health_job_debounced() {
+            let (mut tx, mut mocks) = consumed_no_receipt_setup(None);
+            expect_nonce_health_once(&mut mocks, &mut tx, "817-grace-start-debounce");
+            let tx_clone = tx.clone();
+            mocks
+                .tx_repo
+                .expect_partial_update()
+                .times(2)
+                .returning(move |_, _| Ok(tx_clone.clone()));
+
+            let evm_transaction = make_test_evm_relayer_transaction(create_test_relayer(), mocks);
+            assert!(evm_transaction
+                .reconcile_tx_nonce_state(&tx)
+                .await
+                .unwrap()
+                .is_none());
+            assert!(evm_transaction
+                .reconcile_tx_nonce_state(&tx)
+                .await
+                .unwrap()
+                .is_none());
+        }
+
+        /// #817: should_resubmit honours the long grace for a broadcast tx.
+        #[tokio::test]
+        async fn test_should_resubmit_false_past_short_grace_when_broadcast() {
+            let mut mocks = default_test_mocks();
+            mocks
+                .network_repo
+                .expect_get_by_chain_id()
+                .returning(|_, _| Ok(Some(create_test_network_model())));
+            let mut tx = make_test_transaction(TransactionStatus::Submitted);
+            tx.sent_at = Some((Utc::now() - Duration::minutes(10)).to_rfc3339());
+            tx.metadata = Some(nonce_consumed_since(Utc::now() - Duration::minutes(5)));
+
+            let evm_transaction = make_test_evm_relayer_transaction(create_test_relayer(), mocks);
+            assert!(!evm_transaction.should_resubmit(&tx).await.unwrap());
+        }
+
+        /// #817: the Sent-state resend honours the long grace for a broadcast tx.
+        #[tokio::test]
+        async fn test_sent_past_short_grace_when_broadcast_skips_resubmit() {
+            let mut mocks = default_test_mocks();
+            let mut tx = make_test_transaction(TransactionStatus::Sent);
+            tx.sent_at = Some((Utc::now() - Duration::minutes(10)).to_rfc3339());
+            tx.metadata = Some(nonce_consumed_since(Utc::now() - Duration::minutes(5)));
+            mocks
+                .job_producer
+                .expect_produce_submit_transaction_job()
+                .never();
+
+            let evm_transaction = make_test_evm_relayer_transaction(create_test_relayer(), mocks);
+            let result = evm_transaction.handle_sent_state(tx).await.unwrap();
+            assert_eq!(result.status, TransactionStatus::Sent);
+        }
+
+        /// #817: an expired Sent tx inside the grace is not rewritten to a NOOP; its
+        /// nonce is already consumed, so the NOOP could only get NonceTooLow.
+        #[tokio::test]
+        async fn test_sent_expired_within_grace_skips_noop() {
+            let mut mocks = default_test_mocks();
+            let mut tx = make_test_transaction(TransactionStatus::Sent);
+            tx.sent_at = Some((Utc::now() - Duration::minutes(10)).to_rfc3339());
+            tx.metadata = Some(nonce_consumed_since(Utc::now() - Duration::minutes(5)));
+            tx.valid_until = Some((Utc::now() - Duration::seconds(10)).to_rfc3339());
+            mocks.tx_repo.expect_partial_update().never();
+            mocks
+                .job_producer
+                .expect_produce_submit_transaction_job()
+                .never();
+
+            let evm_transaction = make_test_evm_relayer_transaction(create_test_relayer(), mocks);
+            let result = evm_transaction.handle_sent_state(tx).await.unwrap();
+            assert_eq!(result.status, TransactionStatus::Sent);
         }
     }
 
