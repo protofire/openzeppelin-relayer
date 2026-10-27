@@ -78,6 +78,10 @@ pub const EVM_PENDING_RECOVERY_TRIGGER_SECONDS: i64 = 20;
 /// Minimum age before attempting hash recovery for transactions (in minutes)
 pub const EVM_MIN_AGE_FOR_HASH_RECOVERY_MINUTES: i64 = 2;
 
+/// Grace before a broadcast tx whose nonce is consumed but whose receipt reads null is
+/// finalized Failed (in minutes): receipt reads can lag tens of minutes on load-balanced providers.
+pub const EVM_NONCE_CONSUMED_GRACE_MINUTES: i64 = 60;
+
 /// Minimum number of hashes required before attempting hash recovery
 pub const EVM_MIN_HASHES_FOR_RECOVERY: usize = 3;
 
@@ -104,6 +108,11 @@ pub fn get_evm_pending_recovery_trigger_timeout() -> Duration {
 /// Get minimum age for hash recovery duration
 pub fn get_evm_min_age_for_hash_recovery() -> Duration {
     Duration::minutes(EVM_MIN_AGE_FOR_HASH_RECOVERY_MINUTES)
+}
+
+/// Get the "nonce consumed, no receipt" grace duration
+pub fn get_evm_nonce_consumed_grace() -> Duration {
+    Duration::minutes(EVM_NONCE_CONSUMED_GRACE_MINUTES)
 }
 
 /// Error message patterns indicating a transaction was already submitted or its nonce consumed.

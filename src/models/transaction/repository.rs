@@ -75,6 +75,9 @@ pub struct TransactionMetadata {
     /// Number of submission retries triggered by EVM "nonce too high" errors
     #[serde(default)]
     pub nonce_too_high_retries: u32,
+    /// When reconcile first saw the nonce consumed with no receipt for a known hash (RFC3339)
+    #[serde(default)]
+    pub nonce_consumed_since: Option<String>,
 }
 
 impl TransactionMetadata {
@@ -1300,6 +1303,7 @@ mod tests {
             insufficient_fee_retries: 1,
             try_again_later_retries: 3,
             nonce_too_high_retries: 0,
+            nonce_consumed_since: None,
         };
         assert!(metadata.with_nonce_retries_reset().is_none());
     }
@@ -1312,6 +1316,7 @@ mod tests {
             insufficient_fee_retries: 1,
             try_again_later_retries: 3,
             nonce_too_high_retries: 3,
+            nonce_consumed_since: None,
         };
         let result = metadata.with_nonce_retries_reset();
         assert!(result.is_some());
